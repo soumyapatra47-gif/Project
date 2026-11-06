@@ -1,0 +1,112 @@
+#!/usr/bin/env groovy
+pipeline{
+    agent { label 'BUILD-EC2-CLOUD-SLAVE' }
+    parameters {
+        booleanParam(name: 'SKIP_INIT_TESTS',
+                        defaultValue: true,
+                        description: 'Executes unit tests')
+        booleanParam(name: 'SKIP_INTEGRATION_TESTS',
+                        defaultValue: true,
+                        description: 'Executes integration tests')
+        booleanParam(name: 'SKIP_LOAD_TESTS',
+                        defaultValue: true,
+                        description: 'Executes load tests')                
+    }
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        disableConcurrentBuilds()
+        timeout(time: 1, unit: 'HOURS')
+        timestamps()    
+    }
+    environment {
+        SLACK_THREAD_ID = "null"
+        SOURCE_CODE = 'git@bitbucket.org:paymatrixrepo/om.git'
+        GIT_SHA = sh(returnStdout: true, script: "git log -n 1 --pretty=format:'%h'").trim()
+        TIMESTAMP = "$BUILD_TIMESTAMP"
+        VERSION = "$GIT_SHA" + '-' + "$TIMESTAMP"
+
+        // SNS_TOPIC_ARN = credentials('cffa03cc-f8f8-48c8-8edf-ff44d180790c') // COMMENTED OUT - Not needed for security-only pipeline
+
+        // SONAR credentials - COMMENTED OUT (not neede for security-only pipeline)
+        // SONAR_HOST_URL = credentials('c415605a-719e-470f-8284-1afecc4b5402')
+        // SONAR_USERNAME = credentials('7f0197e4-6760-4d53-9454-66f9b701d85d')
+        // SONAR_PASSWORD = credentials('   f80c77ce-2b3e-4f73-9c4c-134a16890991')
+
+        NVD_API_KEY = credentials('NVD_API_KEY')
+
+        // COMMENTED OUT - Not needed for security-only pieline
+        /*
+        VERSION_TAG_DEV = 'dev'
+        // VERSION_TAG_STAGE = 'stage'
+        // VERSION_TAG_PROD = 'prod'
+        // VERSION_TAG_TEST = 'wip'
+        // VERSION_TAG_TEST_2 = 'wip-2'
+
+        AWS_ECS_REGION = 'ap-south-1'
+
+        //Development
+        AWS_ECS_TASK_DEF_PATH_DEV = './ecs/container-definition-dev.json'
+        AWS_ECS_TASK_DEFINITION_FAMILY_DEV = 'ecs-td-om-dev-backend'
+        AWS_ECS_TASK_DEFIITION_DEV = 'ecs-td-om-dev-backend'
+        AWS_ECS_CLUSTER_DEV = 'cluster-om-dev'
+
+    }
+    stages {
+        stage('Check Prerequisites') {
+            steps {
+            echo "${GIT_BRANCH}"
+            sh 'java -version'
+            sh 'mvn -version'
+            sh 'docker -v'
+            echo "${VERSION}"
+            }
+        }
+        stage('Check Liquibase Changes') {
+            when {
+                anyOf{
+                    changeset "backend/services/api/src/main/resources/config/liquibase/**"
+                    changeset "backend/services/api/src/main/resources/*.yml"
+                    changeset "backend/services/api/pom.xml"
+                    changeset "backend/services/api/Dockerfile"
+                    changeset "backend/services/api/Jenkinsfile"
+                }
+                beforeAgent true
+            }
+            steps {
+                script {
+                    sendSlackNotification("${env.GIT_BRANCH}", "warning", "@channel Liquibase Change Waiting for approval in Dev Pipeline!!", "${env.SLACK})
+                    timeout(time: 5, unit: 'HOURS') {
+                        input id: 'Deploy', message: 'Please approve/deny Liquibase ChangeSet', submitter: 'om-admin', ok: 'Approve', submitterParameter:
+                    }    
+                }
+            }
+        }
+        stage('Security Check') {
+            when {
+                changeset "backend/services/api/**"
+                equals(actual: "${GIT_BRANCH}", expected: "poc-performance-test")
+                beforeAgent true
+            }
+            steps {
+                dir('backend/services/api') {
+                    script {
+                        echo "Dependency security checks are started..."
+                        Integer apiResponseCode=sh(script:"""curl -o -I -w "%{response_code}" --request GET https://nvd.nist.gov""", returnStdout: true).t
+                        echo "API responded with ${apiResponseCode}"
+                        boolean isServiceAwake=(apiResponseCode >= 200 && apiResponseCode <= 500)
+                        if(isServiceAwake){
+                            echo "NVD website has responded back with status ${apiResponseCode}, Performing static analysis..."
+                            sh "mvn org.owasp:dependency-check-maven:check -DnvdApiKey=${NVD_API_KEY}"
+                            echo "Writing HTML report to: ${WORKSPACE}/backend/services/api/target/dependency-check-report.html"
+
+                            //Publish HTML Report to Jenkins Dashboard
+                            publishHTML([
+                            
+                            ])
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
